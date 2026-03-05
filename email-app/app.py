@@ -25,9 +25,93 @@ st.set_page_config(page_title="Bhavya's Message Writer", page_icon="✉️", lay
 # ── Style ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .block-container { max-width: 780px; }
-    .stTextArea textarea { font-size: 14px; }
-    .word-count { font-size: 13px; color: #888; margin-top: -12px; }
+    /* ── Layout ── */
+    .block-container { max-width: 800px; padding-top: 1.5rem; }
+
+    /* ── Typography ── */
+    .stTextArea textarea { font-size: 14px; line-height: 1.6; }
+    .word-count { font-size: 12px; color: #9ca3af; margin-top: -8px; margin-bottom: 8px; }
+
+    /* ── Section cards ── */
+    .section-card {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 1.2rem 1.4rem 0.8rem;
+        margin-bottom: 1rem;
+    }
+    .section-card-dark {
+        background: #f0f9ff;
+        border: 1px solid #bae6fd;
+        border-radius: 10px;
+        padding: 1.2rem 1.4rem 0.8rem;
+        margin-bottom: 1rem;
+    }
+
+    /* ── Section headings ── */
+    h3 { font-size: 1rem !important; font-weight: 600 !important; color: #1e293b !important; margin-bottom: 0.5rem !important; }
+
+    /* ── Primary button ── */
+    div[data-testid="stButton"] > button[kind="primary"] {
+        background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+        border: none;
+        color: white;
+        font-weight: 600;
+        font-size: 1rem;
+        padding: 0.65rem 1.5rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 8px rgba(99,102,241,0.3);
+        transition: box-shadow 0.15s ease;
+    }
+    div[data-testid="stButton"] > button[kind="primary"]:hover {
+        box-shadow: 0 4px 16px rgba(99,102,241,0.45);
+    }
+
+    /* ── Secondary buttons ── */
+    div[data-testid="stButton"] > button[kind="secondary"] {
+        border-radius: 7px;
+        font-size: 0.87rem;
+    }
+
+    /* ── Output message box ── */
+    .message-output {
+        background: #ffffff;
+        border: 2px solid #6366f1;
+        border-radius: 10px;
+        padding: 1.2rem 1.4rem;
+        font-size: 14.5px;
+        line-height: 1.7;
+        white-space: pre-wrap;
+        margin-top: 0.5rem;
+    }
+
+    /* ── Tab styling ── */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 6px;
+        border-bottom: 2px solid #e2e8f0;
+        margin-bottom: 1rem;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 0.5rem 1.1rem;
+        font-weight: 500;
+        font-size: 0.9rem;
+        color: #64748b;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #6366f1 !important;
+        color: white !important;
+    }
+
+    /* ── Expander tweak ── */
+    .streamlit-expanderHeader { font-size: 0.9rem; font-weight: 500; }
+
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] { background: #f8fafc; }
+    [data-testid="stSidebar"] h2 { font-size: 1rem; }
+
+    /* ── History entry label ── */
+    .hist-label { font-size: 0.88rem; color: #475569; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -410,8 +494,15 @@ for _key, _default in [
         st.session_state[_key] = _default
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-st.title("✉️ Bhavya's Message Writer")
-st.caption("Write tailored 100–150 word emails & LinkedIn InMails in seconds.")
+st.markdown("""
+<div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.2rem;">
+  <span style="font-size:1.7rem;">✉️</span>
+  <span style="font-size:1.5rem; font-weight:700; color:#1e293b;">Bhavya's Message Writer</span>
+</div>
+<p style="color:#64748b; margin-top:0; margin-bottom:1.2rem; font-size:0.93rem;">
+  Tailored 100–150 word emails &amp; LinkedIn InMails — in seconds.
+</p>
+""", unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -494,129 +585,331 @@ with st.sidebar:
             st.session_state["resume_bullets"] = {}
             st.rerun()
 
-# ── Main form ─────────────────────────────────────────────────────────────────
-col1, col2 = st.columns(2)
-with col1:
-    msg_type = st.selectbox("Message Type", ["LinkedIn InMail", "Email"])
-with col2:
-    if msg_type == "LinkedIn InMail":
-        purpose = st.selectbox("Purpose", [
-            "Learn about a company / role",
-            "Build relationship for internship search",
-            "Reach out after applying to a role",
-            "Request a referral",
-            "Post-event follow-up (panel / info session)",
-            "Alumni coffee chat",
-            "Thank you after informational chat",
-            "General networking / career advice",
-        ])
-    else:
-        purpose = st.selectbox("Purpose", [
-            "Follow up after meeting a recruiter",
-            "Cold email to recruiter",
-            "Networking (alumni / professional)",
-            "Job / internship inquiry",
-            "Request a referral",
-            "Thank you after interview",
-            "Post-event follow-up",
-            "Thank you after informational chat",
-            "Club or student org",
-            "General student / academic",
-        ])
+# ── STT recorder helper (defined before tabs so it's available everywhere) ────
+def _render_stt_recorder(field_key: str, groq_key: str):
+    """Render a speech-to-text recorder for a given session state field."""
+    if not AUDIO_RECORDER_AVAILABLE or not GROQ_AVAILABLE:
+        return
+    with st.expander("🎤 Record instead of typing"):
+        if not groq_key:
+            st.caption("Add a Groq API key in the sidebar to enable speech-to-text.")
+            return
+        audio_bytes = audio_recorder(text="Click to record", pause_threshold=3.0,
+                                     key=f"recorder_{field_key}")
+        if audio_bytes:
+            with st.spinner("Transcribing..."):
+                try:
+                    transcribed = transcribe_audio(groq_key, audio_bytes)
+                    st.session_state[field_key] = transcribed
+                    st.success(f"Transcribed: {transcribed[:80]}{'...' if len(transcribed) > 80 else ''}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Transcription error: {e}")
 
-st.divider()
+# ── Tabs ───────────────────────────────────────────────────────────────────────
+tab_write, tab_research, tab_history = st.tabs(["✍️  Write", "🔍  Research", "📋  History"])
 
-# ── Recipient ─────────────────────────────────────────────────────────────────
-st.subheader("Recipient")
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 1 — WRITE
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_write:
 
-# LinkedIn auto-fill
-li_col1, li_col2 = st.columns([4, 1])
-with li_col1:
-    linkedin_url = st.text_input(
-        "LinkedIn profile URL (optional)",
-        placeholder="https://linkedin.com/in/...",
-    )
-with li_col2:
-    st.markdown("<br>", unsafe_allow_html=True)  # vertical align
-    fetch_li_btn = st.button("Auto-fill", use_container_width=True)
-
-if fetch_li_btn:
-    if not linkedin_url:
-        st.warning("Paste a LinkedIn URL first.")
-    elif not api_key:
-        st.warning("Enter your API key in the sidebar first.")
-    else:
-        with st.spinner("Fetching LinkedIn profile..."):
-            profile_text, success = fetch_url_text(linkedin_url, max_chars=3000)
-        if success and profile_text:
-            with st.spinner("Extracting info..."):
-                info = extract_profile_info(api_key, profile_text)
-            if info.get("name") or info.get("company"):
-                st.session_state["recipient_name"] = info.get("name", "")
-                st.session_state["recipient_role"] = info.get("role", "")
-                st.session_state["recipient_company"] = info.get("company", "")
-                st.session_state["linkedin_fetch_failed"] = False
-                st.success("Fields auto-filled! Check and edit below if needed.")
-            else:
-                st.session_state["linkedin_fetch_failed"] = True
+    # ── Message type & purpose ────────────────────────────────────────────────
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        msg_type = st.selectbox("Message Type", ["LinkedIn InMail", "Email"])
+    with col2:
+        if msg_type == "LinkedIn InMail":
+            purpose = st.selectbox("Purpose", [
+                "Learn about a company / role",
+                "Build relationship for internship search",
+                "Reach out after applying to a role",
+                "Request a referral",
+                "Post-event follow-up (panel / info session)",
+                "Alumni coffee chat",
+                "Thank you after informational chat",
+                "General networking / career advice",
+            ])
         else:
-            st.session_state["linkedin_fetch_failed"] = True
+            purpose = st.selectbox("Purpose", [
+                "Follow up after meeting a recruiter",
+                "Cold email to recruiter",
+                "Networking (alumni / professional)",
+                "Job / internship inquiry",
+                "Request a referral",
+                "Thank you after interview",
+                "Post-event follow-up",
+                "Thank you after informational chat",
+                "Club or student org",
+                "General student / academic",
+            ])
+    st.markdown('</div>', unsafe_allow_html=True)
 
-if st.session_state["linkedin_fetch_failed"]:
-    st.info(
-        "LinkedIn blocked the request (common). "
-        "Paste the profile text below and click **Extract**."
-    )
-    pasted_li = st.text_area(
-        "Paste LinkedIn profile text",
-        placeholder="Copy the person's name, title, About section, or Experience from their LinkedIn page and paste here.",
-        height=120,
-    )
-    if st.button("Extract from pasted text"):
-        if not pasted_li:
-            st.warning("Paste some profile text first.")
+    # ── Recipient ─────────────────────────────────────────────────────────────
+    st.markdown("### Recipient")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+
+    li_col1, li_col2 = st.columns([4, 1])
+    with li_col1:
+        linkedin_url = st.text_input(
+            "LinkedIn profile URL",
+            placeholder="https://linkedin.com/in/... (optional — auto-fills fields below)",
+        )
+    with li_col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        fetch_li_btn = st.button("Auto-fill", use_container_width=True)
+
+    if fetch_li_btn:
+        if not linkedin_url:
+            st.warning("Paste a LinkedIn URL first.")
         elif not api_key:
             st.warning("Enter your API key in the sidebar first.")
         else:
-            with st.spinner("Extracting..."):
-                info = extract_profile_info(api_key, pasted_li)
-            if info.get("name") or info.get("company"):
-                st.session_state["recipient_name"] = info.get("name", "")
-                st.session_state["recipient_role"] = info.get("role", "")
-                st.session_state["recipient_company"] = info.get("company", "")
-                st.session_state["linkedin_fetch_failed"] = False
-                st.success("Fields auto-filled!")
-                st.rerun()
+            with st.spinner("Fetching LinkedIn profile..."):
+                profile_text, success = fetch_url_text(linkedin_url, max_chars=3000)
+            if success and profile_text:
+                with st.spinner("Extracting info..."):
+                    info = extract_profile_info(api_key, profile_text)
+                if info.get("name") or info.get("company"):
+                    st.session_state["recipient_name"] = info.get("name", "")
+                    st.session_state["recipient_role"] = info.get("role", "")
+                    st.session_state["recipient_company"] = info.get("company", "")
+                    st.session_state["linkedin_fetch_failed"] = False
+                    st.success("Fields auto-filled! Check and edit below if needed.")
+                else:
+                    st.session_state["linkedin_fetch_failed"] = True
             else:
-                st.warning("Couldn't extract info — fill the fields below manually.")
+                st.session_state["linkedin_fetch_failed"] = True
 
-col3, col4, col5 = st.columns(3)
-with col3:
-    recipient_name = st.text_input("First name", key="recipient_name",
-                                   placeholder="e.g. Nikhil")
-with col4:
-    recipient_role = st.text_input("Role / Title", key="recipient_role",
-                                   placeholder="e.g. Head of S&O")
-with col5:
-    recipient_company = st.text_input("Company", key="recipient_company",
-                                      placeholder="e.g. Databricks")
+    if st.session_state["linkedin_fetch_failed"]:
+        st.info(
+            "LinkedIn blocked the request (common). "
+            "Paste the profile text below and click **Extract**."
+        )
+        pasted_li = st.text_area(
+            "Paste LinkedIn profile text",
+            placeholder="Copy the person's name, title, About section, or Experience from their LinkedIn page and paste here.",
+            height=120,
+        )
+        if st.button("Extract from pasted text"):
+            if not pasted_li:
+                st.warning("Paste some profile text first.")
+            elif not api_key:
+                st.warning("Enter your API key in the sidebar first.")
+            else:
+                with st.spinner("Extracting..."):
+                    info = extract_profile_info(api_key, pasted_li)
+                if info.get("name") or info.get("company"):
+                    st.session_state["recipient_name"] = info.get("name", "")
+                    st.session_state["recipient_role"] = info.get("role", "")
+                    st.session_state["recipient_company"] = info.get("company", "")
+                    st.session_state["linkedin_fetch_failed"] = False
+                    st.success("Fields auto-filled!")
+                    st.rerun()
+                else:
+                    st.warning("Couldn't extract info — fill the fields below manually.")
 
-mutual_connection = st.text_input(
-    "Mutual connection (optional)",
-    placeholder="e.g. Shilpa Gopal (MBA '25) suggested I reach out",
-)
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        recipient_name = st.text_input("First name", key="recipient_name",
+                                       placeholder="e.g. Nikhil")
+    with col4:
+        recipient_role = st.text_input("Role / Title", key="recipient_role",
+                                       placeholder="e.g. Head of S&O")
+    with col5:
+        recipient_company = st.text_input("Company", key="recipient_company",
+                                          placeholder="e.g. Databricks")
 
-st.divider()
+    mutual_connection = st.text_input(
+        "Mutual connection (optional)",
+        placeholder="e.g. Shilpa Gopal (MBA '25) suggested I reach out",
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ── LinkedIn Profile Analyzer ─────────────────────────────────────────────────
-with st.expander("LinkedIn Profile Analyzer — paste full profile for AI insights"):
-    li_full_text = st.text_area(
-        "Paste the full LinkedIn profile text",
-        placeholder="Copy everything from their LinkedIn page: name, title, About, Experience, Education...",
-        height=200,
+    # ── Job Description ───────────────────────────────────────────────────────
+    st.markdown("### Job Description")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    jd_col1, jd_col2 = st.columns([4, 1])
+    with jd_col1:
+        jd_url = st.text_input(
+            "Job posting URL",
+            placeholder="https://jobs.lever.co/... — paste URL to auto-fetch (optional)",
+            label_visibility="collapsed",
+        )
+    with jd_col2:
+        fetch_jd_btn = st.button("Fetch JD", use_container_width=True)
+
+    if fetch_jd_btn:
+        if not jd_url:
+            st.warning("Paste a job URL first.")
+        else:
+            with st.spinner("Fetching job description..."):
+                jd_content, success = fetch_url_text(jd_url, max_chars=4000)
+            if success and jd_content:
+                st.session_state["jd_text"] = jd_content
+                st.success("Job description fetched! Review/edit below.")
+            else:
+                st.warning("Couldn't fetch the page. Paste the JD text below manually.")
+
+    jd_text = st.text_area(
+        "Job description",
+        key="jd_text",
+        placeholder="Job description will appear here after fetching, or paste it directly.",
+        height=120,
         label_visibility="collapsed",
     )
-    if st.button("Analyze Profile", use_container_width=True):
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Additional Context ────────────────────────────────────────────────────
+    st.markdown("### Additional Context")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+
+    input_mode = st.radio("Input mode",
+                           ["Quick form", "Paste text", "Both"],
+                           horizontal=True,
+                           label_visibility="collapsed")
+
+    key_angle = ""
+    pasted_context = ""
+
+    if input_mode in ["Quick form", "Both"]:
+        _render_stt_recorder("key_angle_text", groq_api_key)
+        key_angle = st.text_area(
+            "What's the specific angle or ask?",
+            value=st.session_state["key_angle_text"],
+            placeholder=(
+                "e.g. I applied to the MBA Intern S&O role. I want to ask for a 20-min chat and "
+                "mention my background in consulting + Chief of Staff work."
+            ),
+            height=90,
+            key="key_angle_input",
+        )
+        st.session_state["key_angle_text"] = key_angle
+
+    if input_mode in ["Paste text", "Both"]:
+        _render_stt_recorder("pasted_context_text", groq_api_key)
+        pasted_context = st.text_area(
+            "Paste any additional context",
+            value=st.session_state["pasted_context_text"],
+            placeholder="Recent news about the company, the person's recent posts, extra background, etc.",
+            height=120,
+            key="pasted_context_input",
+        )
+        st.session_state["pasted_context_text"] = pasted_context
+
+    if st.session_state.get("company_news"):
+        st.caption(
+            f"News hooks loaded for **{st.session_state.get('company_news_for', '')}** — "
+            "go to the Research tab to browse & add them."
+        )
+
+    tone = st.select_slider("Tone", options=["More formal", "Balanced", "Warm & personal"],
+                             value="Balanced")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Generate ──────────────────────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("Generate Message", type="primary", use_container_width=True):
+        if not api_key:
+            st.error("Please enter your Anthropic API key in the sidebar.")
+        elif not recipient_name or not recipient_company:
+            st.error("Please fill in at least the recipient's name and company.")
+        else:
+            user_prompt = f"""Write a {msg_type} for the following situation:
+
+Recipient: {recipient_name}, {recipient_role} at {recipient_company}
+Message purpose: {purpose}
+Tone: {tone}
+Mutual connection: {mutual_connection if mutual_connection else "None"}
+
+My background to draw from:
+{background}
+"""
+            if jd_text:
+                user_prompt += f"\nJob description (use this to tailor the message to the role):\n{jd_text}\n"
+            if key_angle:
+                user_prompt += f"\nKey angle / specific ask:\n{key_angle}\n"
+            if pasted_context:
+                user_prompt += f"\nAdditional context:\n{pasted_context}\n"
+
+            user_prompt += "\nRemember: strictly 100-150 words for InMail, natural length for email. Be specific to this person and company."
+
+            system_prompt = build_system_prompt(background, st.session_state["resume_bullets"],
+                                                 recipient_company=recipient_company)
+
+            with st.spinner("Writing your message..."):
+                try:
+                    result = generate_message(api_key, user_prompt, system_prompt)
+                    st.session_state["result"] = result
+                    save_to_history({
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "msg_type": msg_type,
+                        "purpose": purpose,
+                        "recipient_name": recipient_name,
+                        "recipient_role": recipient_role,
+                        "recipient_company": recipient_company,
+                        "message": result,
+                    })
+                except Exception as e:
+                    if "API_KEY" in str(e) or "invalid" in str(e).lower():
+                        st.error("Invalid API key. Check your key at console.anthropic.com.")
+                    else:
+                        st.error(f"Error: {e}")
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    if "result" in st.session_state:
+        st.markdown("<br>", unsafe_allow_html=True)
+        result_text = st.session_state["result"]
+        wc = count_words(result_text)
+
+        st.markdown(
+            f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.4rem;">'
+            f'<span style="font-size:1rem;font-weight:600;color:#1e293b;">Your Message</span>'
+            f'<span style="font-size:0.82rem;color:#6366f1;font-weight:500;">{wc} words</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        edited = st.text_area("Edit before copying", value=result_text, height=270,
+                               label_visibility="collapsed", key="output_editor")
+        edited_wc = count_words(edited)
+        st.markdown(f'<p class="word-count">{edited_wc} words</p>', unsafe_allow_html=True)
+
+        col_a, col_b, col_c = st.columns([2, 2, 1])
+        with col_a:
+            if st.button("Regenerate", use_container_width=True):
+                del st.session_state["result"]
+                st.rerun()
+        with col_b:
+            st.download_button("Download .txt", data=edited,
+                               file_name="message.txt", mime="text/plain",
+                               use_container_width=True)
+        with col_c:
+            st.markdown(
+                f'<p style="font-size:0.78rem;color:#9ca3af;padding-top:8px;text-align:center;">'
+                f'Saved to history</p>',
+                unsafe_allow_html=True,
+            )
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 2 — RESEARCH
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_research:
+    st.caption("Use these tools to research your recipient before writing. Results feed into the Write tab.")
+
+    # ── LinkedIn Profile Analyzer ─────────────────────────────────────────────
+    st.markdown("### LinkedIn Profile Analyzer")
+    st.markdown('<div class="section-card-dark">', unsafe_allow_html=True)
+    st.caption("Paste the full LinkedIn profile text — AI extracts highlights, personalization hooks, and suggests a message angle.")
+
+    li_full_text = st.text_area(
+        "LinkedIn profile text",
+        placeholder="Copy everything from their LinkedIn page: name, title, About, Experience, Education...",
+        height=180,
+        label_visibility="collapsed",
+    )
+    if st.button("Analyze Profile", use_container_width=True, key="analyze_profile_btn"):
         if not li_full_text.strip():
             st.warning("Paste some profile text first.")
         elif not api_key:
@@ -626,67 +919,34 @@ with st.expander("LinkedIn Profile Analyzer — paste full profile for AI insigh
                 try:
                     analysis = analyze_linkedin_profile(api_key, li_full_text, background)
                     st.session_state["li_analysis"] = analysis
-                    # Also try to auto-fill recipient fields
                     info = extract_profile_info(api_key, li_full_text)
                     if info.get("name") or info.get("company"):
                         st.session_state["recipient_name"] = info.get("name", st.session_state["recipient_name"])
                         st.session_state["recipient_role"] = info.get("role", st.session_state["recipient_role"])
                         st.session_state["recipient_company"] = info.get("company", st.session_state["recipient_company"])
-                        st.success("Recipient fields auto-filled!")
-                        st.rerun()
+                        st.success("Recipient fields auto-filled in the Write tab!")
                 except Exception as e:
                     st.error(f"Error: {e}")
+
     if st.session_state["li_analysis"]:
         st.markdown(st.session_state["li_analysis"])
-        if st.button("Use this angle in context", key="use_angle_btn"):
-            # Pre-populate the key angle field with suggested angle
+        if st.button("Send suggested angle → Write tab", key="use_angle_btn"):
             analysis_text = st.session_state["li_analysis"]
             angle_match = re.search(r"## Suggested Message Angle\n(.+?)(?:\n##|$)", analysis_text, re.DOTALL)
             if angle_match:
                 st.session_state["key_angle_text"] = angle_match.group(1).strip()
-            st.rerun()
+                st.success("Angle sent! Switch to the Write tab and it'll be pre-filled.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Job Description ───────────────────────────────────────────────────────────
-st.subheader("Job Description (optional)")
-jd_col1, jd_col2 = st.columns([4, 1])
-with jd_col1:
-    jd_url = st.text_input(
-        "Job posting URL",
-        placeholder="https://jobs.lever.co/... or any job board URL",
-        label_visibility="collapsed",
-    )
-with jd_col2:
-    fetch_jd_btn = st.button("Fetch JD", use_container_width=True)
+    # ── Company News ──────────────────────────────────────────────────────────
+    st.markdown("### Company News Search")
+    st.markdown('<div class="section-card-dark">', unsafe_allow_html=True)
+    st.caption("Searches the last 6 months of news about the company and generates message hooks you can reference.")
 
-if fetch_jd_btn:
-    if not jd_url:
-        st.warning("Paste a job URL first.")
-    else:
-        with st.spinner("Fetching job description..."):
-            jd_content, success = fetch_url_text(jd_url, max_chars=4000)
-        if success and jd_content:
-            st.session_state["jd_text"] = jd_content
-            st.success("Job description fetched! Review/edit below.")
-        else:
-            st.warning("Couldn't fetch the page. Paste the JD text below manually.")
-
-jd_text = st.text_area(
-    "Job description text",
-    key="jd_text",
-    placeholder="Job description will appear here after fetching, or paste it manually.",
-    height=130,
-    label_visibility="collapsed",
-)
-
-st.divider()
-
-# ── Company Research ───────────────────────────────────────────────────────────
-with st.expander("Company News Search — find recent updates to reference in your message"):
-    st.caption("Searches the web for the last 6 months of news about the company and suggests message hooks.")
     news_company = st.text_input(
-        "Company to search",
+        "Company",
         value=st.session_state.get("recipient_company", ""),
         placeholder="e.g. Databricks",
         key="news_company_input",
@@ -697,7 +957,7 @@ with st.expander("Company News Search — find recent updates to reference in yo
         placeholder="e.g. Strategy & Operations",
         key="news_role_input",
     )
-    if st.button("Search recent news", use_container_width=True):
+    if st.button("Search recent news", use_container_width=True, key="search_news_btn"):
         if not news_company.strip():
             st.warning("Enter a company name first.")
         elif not api_key:
@@ -728,189 +988,85 @@ with st.expander("Company News Search — find recent updates to reference in yo
                     st.session_state["pasted_context_text"] = (
                         f"{existing}\n\nRecent news hook: {hook_text}".strip()
                     )
-                    st.rerun()
+                    st.success("Hook added to context in the Write tab!")
     elif "company_news" in st.session_state and st.session_state["company_news"] == []:
         st.info("No recent news found — try a different company name or add context manually.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-st.divider()
-
-# ── Context ───────────────────────────────────────────────────────────────────
-st.subheader("Additional Context")
-input_mode = st.radio("How do you want to add context?",
-                       ["Quick form", "Paste text", "Both"],
-                       horizontal=True)
-
-key_angle = ""
-pasted_context = ""
-
-def _render_stt_recorder(field_key: str, groq_key: str):
-    """Render a speech-to-text recorder for a given session state field."""
-    if not AUDIO_RECORDER_AVAILABLE or not GROQ_AVAILABLE:
-        return
-    with st.expander("🎤 Record instead of typing"):
-        if not groq_key:
-            st.caption("Add a Groq API key in the sidebar to enable speech-to-text.")
-            return
-        audio_bytes = audio_recorder(text="Click to record", pause_threshold=3.0,
-                                     key=f"recorder_{field_key}")
-        if audio_bytes:
-            with st.spinner("Transcribing..."):
-                try:
-                    transcribed = transcribe_audio(groq_key, audio_bytes)
-                    st.session_state[field_key] = transcribed
-                    st.success(f"Transcribed: {transcribed[:80]}{'...' if len(transcribed) > 80 else ''}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Transcription error: {e}")
-
-if input_mode in ["Quick form", "Both"]:
-    _render_stt_recorder("key_angle_text", groq_api_key)
-    key_angle = st.text_area(
-        "What's the specific angle or ask?",
-        value=st.session_state["key_angle_text"],
-        placeholder=(
-            "e.g. I applied to the MBA Intern S&O role. I want to ask for a 20-min chat and "
-            "mention my background in consulting + Chief of Staff work."
-        ),
-        height=100,
-        key="key_angle_input",
-    )
-    st.session_state["key_angle_text"] = key_angle
-
-if input_mode in ["Paste text", "Both"]:
-    _render_stt_recorder("pasted_context_text", groq_api_key)
-    pasted_context = st.text_area(
-        "Paste any additional context",
-        value=st.session_state["pasted_context_text"],
-        placeholder="Recent news about the company, the person's recent posts, extra background, etc.",
-        height=130,
-        key="pasted_context_input",
-    )
-    st.session_state["pasted_context_text"] = pasted_context
-
-tone = st.select_slider("Tone", options=["More formal", "Balanced", "Warm & personal"],
-                         value="Balanced")
-
-st.divider()
-
-# ── Generate ──────────────────────────────────────────────────────────────────
-if st.button("Generate Message", type="primary", use_container_width=True):
-    if not api_key:
-        st.error("Please enter your Anthropic API key in the sidebar.")
-    elif not recipient_name or not recipient_company:
-        st.error("Please fill in at least the recipient's name and company.")
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 3 — HISTORY
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_history:
+    history = load_history()
+    if not history:
+        st.markdown(
+            '<div style="text-align:center;padding:3rem 1rem;color:#94a3b8;">'
+            '<div style="font-size:2.5rem;margin-bottom:0.5rem;">📭</div>'
+            '<div style="font-size:1rem;font-weight:500;">No messages yet</div>'
+            '<div style="font-size:0.87rem;margin-top:0.3rem;">Generate a message in the Write tab and it\'ll appear here.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
     else:
-        user_prompt = f"""Write a {msg_type} for the following situation:
-
-Recipient: {recipient_name}, {recipient_role} at {recipient_company}
-Message purpose: {purpose}
-Tone: {tone}
-Mutual connection: {mutual_connection if mutual_connection else "None"}
-
-My background to draw from:
-{background}
-"""
-        if jd_text:
-            user_prompt += f"\nJob description (use this to tailor the message to the role):\n{jd_text}\n"
-        if key_angle:
-            user_prompt += f"\nKey angle / specific ask:\n{key_angle}\n"
-        if pasted_context:
-            user_prompt += f"\nAdditional context:\n{pasted_context}\n"
-
-        user_prompt += "\nRemember: strictly 100-150 words for InMail, natural length for email. Be specific to this person and company."
-
-        system_prompt = build_system_prompt(background, st.session_state["resume_bullets"],
-                                             recipient_company=recipient_company)
-
-        with st.spinner("Writing your message..."):
-            try:
-                result = generate_message(api_key, user_prompt, system_prompt)
-                st.session_state["result"] = result
-                # Save to persistent history
-                save_to_history({
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "msg_type": msg_type,
-                    "purpose": purpose,
-                    "recipient_name": recipient_name,
-                    "recipient_role": recipient_role,
-                    "recipient_company": recipient_company,
-                    "message": result,
-                })
-            except Exception as e:
-                if "API_KEY" in str(e) or "invalid" in str(e).lower():
-                    st.error("Invalid API key. Check your key at console.anthropic.com.")
-                else:
-                    st.error(f"Error: {e}")
-
-# ── Output ────────────────────────────────────────────────────────────────────
-if "result" in st.session_state:
-    st.divider()
-    st.subheader("Your Message")
-    result_text = st.session_state["result"]
-    wc = count_words(result_text)
-    st.markdown(f'<p class="word-count">{wc} words</p>', unsafe_allow_html=True)
-
-    edited = st.text_area("Edit before copying", value=result_text, height=280,
-                           label_visibility="collapsed")
-    edited_wc = count_words(edited)
-    st.markdown(f'<p class="word-count">{edited_wc} words</p>', unsafe_allow_html=True)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Regenerate", use_container_width=True):
-            del st.session_state["result"]
-            st.rerun()
-    with col_b:
-        st.download_button("Download as .txt", data=edited,
-                           file_name="message.txt", mime="text/plain",
-                           use_container_width=True)
-
-# ── Message History ────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("Message History")
-history = load_history()
-if not history:
-    st.caption("No messages yet — generate one above and it'll appear here.")
-else:
-    h_col1, h_col2 = st.columns([3, 1])
-    with h_col1:
-        st.caption(f"{len(history)} message(s) saved")
-    with h_col2:
-        csv_data = history_to_csv(history)
-        st.download_button("Download CSV", data=csv_data,
-                           file_name="message_history.csv", mime="text/csv",
-                           use_container_width=True)
-
-    if st.session_state["history_confirm_clear"]:
-        st.warning("Are you sure? This will permanently delete all history.")
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            if st.button("Yes, clear all", use_container_width=True, type="primary"):
-                import os as _os
-                if _os.path.exists(HISTORY_FILE):
-                    _os.remove(HISTORY_FILE)
-                st.session_state["history_confirm_clear"] = False
-                st.rerun()
-        with cc2:
-            if st.button("Cancel", use_container_width=True):
-                st.session_state["history_confirm_clear"] = False
-                st.rerun()
-    else:
-        if st.button("Clear all history", use_container_width=True):
-            st.session_state["history_confirm_clear"] = True
-            st.rerun()
-
-    for i, entry in enumerate(reversed(history)):
-        label = (f"{entry.get('timestamp', '')}  ·  "
-                 f"{entry.get('recipient_name', '?')} @ {entry.get('recipient_company', '?')}  ·  "
-                 f"{entry.get('msg_type', '')}")
-        with st.expander(label):
-            st.caption(entry.get("purpose", ""))
-            st.text_area("Message", value=entry.get("message", ""), height=200,
-                         label_visibility="collapsed",
-                         key=f"hist_msg_{i}")
-            st.download_button("Download", data=entry.get("message", ""),
-                               file_name=f"message_{entry.get('timestamp','').replace(' ','_').replace(':','-')}.txt",
-                               mime="text/plain",
-                               key=f"hist_dl_{i}",
+        h_col1, h_col2, h_col3 = st.columns([3, 1, 1])
+        with h_col1:
+            st.markdown(
+                f'<p style="color:#64748b;font-size:0.9rem;padding-top:6px;">'
+                f'{len(history)} message{"s" if len(history) != 1 else ""} saved</p>',
+                unsafe_allow_html=True,
+            )
+        with h_col2:
+            csv_data = history_to_csv(history)
+            st.download_button("Download CSV", data=csv_data,
+                               file_name="message_history.csv", mime="text/csv",
                                use_container_width=True)
+        with h_col3:
+            if st.session_state["history_confirm_clear"]:
+                pass  # handled below
+            else:
+                if st.button("Clear all", use_container_width=True):
+                    st.session_state["history_confirm_clear"] = True
+                    st.rerun()
+
+        if st.session_state["history_confirm_clear"]:
+            st.warning("This will permanently delete all saved messages. Are you sure?")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("Yes, delete all", use_container_width=True, type="primary"):
+                    if os.path.exists(HISTORY_FILE):
+                        os.remove(HISTORY_FILE)
+                    st.session_state["history_confirm_clear"] = False
+                    st.rerun()
+            with cc2:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state["history_confirm_clear"] = False
+                    st.rerun()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        for i, entry in enumerate(reversed(history)):
+            ts = entry.get("timestamp", "")
+            name = entry.get("recipient_name", "?")
+            company = entry.get("recipient_company", "?")
+            mtype = entry.get("msg_type", "")
+            label = f"{ts}  ·  **{name}** @ {company}  ·  {mtype}"
+            with st.expander(label):
+                purpose_label = entry.get("purpose", "")
+                if purpose_label:
+                    st.caption(purpose_label)
+                msg_val = entry.get("message", "")
+                wc_h = count_words(msg_val)
+                st.markdown(
+                    f'<p style="font-size:0.78rem;color:#6366f1;margin-bottom:4px;">{wc_h} words</p>',
+                    unsafe_allow_html=True,
+                )
+                st.text_area("Message", value=msg_val, height=200,
+                             label_visibility="collapsed",
+                             key=f"hist_msg_{i}")
+                st.download_button(
+                    "Download .txt",
+                    data=msg_val,
+                    file_name=f"message_{ts.replace(' ', '_').replace(':', '-')}.txt",
+                    mime="text/plain",
+                    key=f"hist_dl_{i}",
+                    use_container_width=True,
+                )
