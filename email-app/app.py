@@ -1,10 +1,23 @@
 import os
+import csv
+import io
+import datetime
 import anthropic
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import json
 import re
+try:
+    from audio_recorder_streamlit import audio_recorder
+    AUDIO_RECORDER_AVAILABLE = True
+except ImportError:
+    AUDIO_RECORDER_AVAILABLE = False
+try:
+    import groq as groq_sdk
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Bhavya's Message Writer", page_icon="✉️", layout="centered")
@@ -17,6 +30,35 @@ st.markdown("""
     .word-count { font-size: 13px; color: #888; margin-top: -12px; }
 </style>
 """, unsafe_allow_html=True)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "message_history.json")
+
+# ── History helpers ───────────────────────────────────────────────────────────
+def load_history() -> list:
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_to_history(entry: dict):
+    history = load_history()
+    history.append(entry)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+
+def history_to_csv(history: list) -> str:
+    if not history:
+        return ""
+    fieldnames = ["timestamp", "msg_type", "purpose", "recipient_name",
+                  "recipient_role", "recipient_company", "message"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(history)
+    return buf.getvalue()
 
 # ── Few-shot training examples from Bhavya's real messages ───────────────────
 EXAMPLES = """
@@ -63,7 +105,7 @@ DEFAULT_BACKGROUND = """- Haas MBA '27 (Class of 2027), UC Berkeley, first-year 
 - Interests: PM, Strategy & Ops, education tech, AI/ML products, creative tech, monetization"""
 
 # ── System prompt builder ─────────────────────────────────────────────────────
-def build_system_prompt(background_text: str, resume_bullets: dict) -> str:
+def build_system_prompt(background_text: str, resume_bullets: dict, recipient_company: str = "") -> str:
     prompt = f"""You are a professional message writer for Bhavya Berlia, a first-year MBA student at UC Berkeley Haas (Class of 2027). You write tailored emails and LinkedIn InMails in Bhavya's authentic voice.
 
 BHAVYA'S BACKGROUND:
@@ -88,12 +130,31 @@ REAL EXAMPLES OF BHAVYA'S MESSAGES:
 {EXAMPLES}
 """
     if resume_bullets:
-        prompt += """
-BHAVYA'S RESUME BULLETS BY ROLE TYPE:
-Use these to pick the most relevant 2-3 highlights based on the target role/company. Match bullets to what the recipient cares about.
-"""
-        for role_type, bullets in resume_bullets.items():
-            prompt += f"\n[{role_type}]\n{bullets}\n"
+        nested = is_nested_bullets(resume_bullets)
+        if nested:
+            prompt += "\nBHAVYA'S RESUME BULLETS (organized by company and role type):\n"
+            prompt += "Company-specific bullets are listed first — prefer those over generic ones.\n"
+            # Company-specific bullets first
+            company_key = next(
+                (k for k in resume_bullets if k.lower() == recipient_company.lower()),
+                None
+            ) if recipient_company else None
+            if company_key:
+                prompt += f"\n[{company_key} — PREFERRED for this message]\n"
+                for role, bullets in resume_bullets[company_key].items():
+                    prompt += f"  [{role}]\n{bullets}\n"
+            # Generic/other companies as fallback
+            for company, roles in resume_bullets.items():
+                if company_key and company.lower() == company_key.lower():
+                    continue
+                prompt += f"\n[{company}]\n"
+                for role, bullets in roles.items():
+                    prompt += f"  [{role}]\n{bullets}\n"
+        else:
+            prompt += "\nBHAVYA'S RESUME BULLETS BY ROLE TYPE:\n"
+            prompt += "Use these to pick the most relevant 2-3 highlights based on the target role/company.\n"
+            for role_type, bullets in resume_bullets.items():
+                prompt += f"\n[{role_type}]\n{bullets}\n"
 
     prompt += """
 INSTRUCTIONS:
@@ -101,7 +162,7 @@ INSTRUCTIONS:
 - Match the tone and structure from the examples above.
 - Be specific to the recipient's company and role — generic messages are unacceptable.
 - If bullets are appropriate (e.g., recruiter follow-up with resume), use them.
-- If resume bullets by role type are provided above, select the most relevant ones for this specific message.
+- If resume bullets are provided above, select the most relevant ones for this specific message.
 - Count words carefully and stay within the length rule.
 """
     return prompt
@@ -160,29 +221,54 @@ def extract_profile_info(api_key: str, profile_text: str) -> dict:
         pass
     return {}
 
+def is_nested_bullets(d: dict) -> bool:
+    """Return True if dict is {str: {str: str}} (company+role nested format)."""
+    return d and all(isinstance(v, dict) for v in d.values())
+
 def parse_resume_file(uploaded_file) -> dict:
-    """Parse an uploaded .json or .txt resume bullets file."""
+    """Parse an uploaded .json or .txt resume bullets file.
+
+    Supports two formats:
+    - Flat: {"PM": "...", "S&O": "..."} — role type only
+    - Nested: {"generic": {"PM": "..."}, "Databricks": {"S&O": "..."}} — company + role type
+
+    TXT supports:
+    - [Section] headers → flat
+    - [Company/RoleType] headers → nested (stored as nested dict)
+    """
     content = uploaded_file.read().decode("utf-8")
     if uploaded_file.name.endswith(".json"):
         try:
             return json.loads(content)
         except Exception:
             return {}
-    # Parse .txt with [Section] headers
+    # Parse .txt with [Section] or [Company/Role] headers
     result = {}
-    current_section = None
+    current_key = None  # tuple (company, role) or (role,)
     lines = []
+
+    def flush():
+        if current_key and lines:
+            if len(current_key) == 2:
+                company, role = current_key
+                result.setdefault(company, {})[role] = "\n".join(lines)
+            else:
+                result[current_key[0]] = "\n".join(lines)
+
     for line in content.splitlines():
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
-            if current_section and lines:
-                result[current_section] = "\n".join(lines)
-            current_section = stripped[1:-1]
+            flush()
             lines = []
-        elif current_section and stripped:
+            header = stripped[1:-1]
+            if "/" in header:
+                parts = header.split("/", 1)
+                current_key = (parts[0].strip(), parts[1].strip())
+            else:
+                current_key = (header,)
+        elif current_key and stripped:
             lines.append(stripped)
-    if current_section and lines:
-        result[current_section] = "\n".join(lines)
+    flush()
     return result
 
 def generate_message(api_key: str, user_prompt: str, system_prompt: str) -> str:
@@ -194,6 +280,102 @@ def generate_message(api_key: str, user_prompt: str, system_prompt: str) -> str:
         messages=[{"role": "user", "content": user_prompt}]
     )
     return message.content[0].text
+
+# ── Company news search ───────────────────────────────────────────────────────
+def search_company_news(api_key: str, company: str, role: str = "") -> list[dict]:
+    """Search DuckDuckGo for recent company news and summarize with Claude Haiku.
+
+    Returns a list of dicts: [{title, snippet, url, hook}]
+    """
+    # Build search query targeting last 6 months of news
+    query = f"{company} news updates 2025 2026"
+    if role:
+        team_guess = role.split()[0] if role else ""
+        query = f"{company} {team_guess} news 2025 2026"
+
+    search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&df=6m"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        resp = requests.get(search_url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        for result in soup.select(".result")[:8]:
+            title_el = result.select_one(".result__title")
+            snippet_el = result.select_one(".result__snippet")
+            url_el = result.select_one(".result__url")
+            if title_el and snippet_el:
+                results.append({
+                    "title": title_el.get_text(strip=True),
+                    "snippet": snippet_el.get_text(strip=True),
+                    "url": url_el.get_text(strip=True) if url_el else "",
+                })
+        if not results:
+            return []
+        # Summarize and generate hooks with Claude Haiku
+        results_text = "\n".join(
+            f"{i+1}. {r['title']}\n   {r['snippet']}" for i, r in enumerate(results)
+        )
+        client = anthropic.Anthropic(api_key=api_key)
+        resp2 = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            messages=[{"role": "user", "content": (
+                f"Bhavya Berlia (Haas MBA student) is reaching out to someone at {company}. "
+                f"Here are recent news results about {company}:\n\n{results_text}\n\n"
+                "For each genuinely useful and recent update (skip generic/irrelevant ones), "
+                "provide a one-line message hook Bhavya could reference to show she's done her homework. "
+                "Format as JSON array: "
+                '[{"title": "...", "hook": "I saw that [company] recently [did X] — ..."}, ...]'
+                "\nReturn ONLY the JSON array, no other text."
+            )}]
+        )
+        raw = resp2.content[0].text.strip()
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if match:
+            parsed = json.loads(match.group())
+            # Merge hook back with original results
+            for item in parsed:
+                for r in results:
+                    if item.get("title", "")[:30] in r["title"]:
+                        item["url"] = r.get("url", "")
+                        break
+            return parsed[:5]
+    except Exception:
+        pass
+    return []
+
+# ── LinkedIn analyzer ─────────────────────────────────────────────────────────
+def analyze_linkedin_profile(api_key: str, profile_text: str, background_text: str) -> str:
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=700,
+        messages=[{"role": "user", "content": (
+            "Analyze this LinkedIn profile for Bhavya Berlia (MBA student at Haas) who wants to reach out.\n\n"
+            f"BHAVYA'S BACKGROUND:\n{background_text}\n\n"
+            f"LINKEDIN PROFILE:\n{profile_text[:4000]}\n\n"
+            "Return a structured analysis with these four sections using markdown:\n"
+            "## Name / Role / Company\n(one line: Name | Role | Company)\n\n"
+            "## Key Career Highlights\n(3-4 bullets of their most notable achievements)\n\n"
+            "## Personalization Hooks\n(2-3 specific things to reference — overlaps with Bhavya, interesting projects, shared background)\n\n"
+            "## Suggested Message Angle\n(one sentence: what angle would resonate most for Bhavya's outreach)"
+        )}]
+    )
+    return resp.content[0].text
+
+# ── Groq Whisper transcription ────────────────────────────────────────────────
+def transcribe_audio(groq_api_key: str, audio_bytes: bytes) -> str:
+    client = groq_sdk.Groq(api_key=groq_api_key)
+    transcription = client.audio.transcriptions.create(
+        model="whisper-large-v3-turbo",
+        file=("audio.wav", audio_bytes),
+    )
+    return transcription.text
 
 # ── API key resolution ────────────────────────────────────────────────────────
 def resolve_api_key() -> tuple[str, str]:
@@ -217,6 +399,12 @@ for _key, _default in [
     ("linkedin_fetch_failed", False),
     ("jd_text", ""),
     ("resume_bullets", {}),
+    ("li_analysis", ""),
+    ("key_angle_text", ""),
+    ("pasted_context_text", ""),
+    ("history_confirm_clear", False),
+    ("company_news", None),
+    ("company_news_for", ""),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -246,6 +434,30 @@ with st.sidebar:
                 "Then restart the app — no more typing!"
             )
     st.divider()
+    # Groq API key for speech-to-text
+    st.subheader("Groq API Key (Speech-to-Text)")
+    _groq_auto = ""
+    try:
+        _groq_auto = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        pass
+    if not _groq_auto:
+        _groq_auto = os.environ.get("GROQ_API_KEY", "")
+    if _groq_auto:
+        st.success("Groq key loaded automatically")
+        with st.expander("Override Groq key"):
+            _groq_override = st.text_input("Paste a different Groq key", type="password",
+                                           label_visibility="collapsed", key="groq_key_override",
+                                           placeholder="gsk_...")
+        groq_api_key = _groq_override if _groq_override else _groq_auto
+    else:
+        groq_api_key = st.text_input("Groq API Key", type="password",
+                                     key="groq_key_input",
+                                     help="Free at console.groq.com — used for speech-to-text",
+                                     placeholder="gsk_...")
+        if not groq_api_key:
+            st.caption("Get a free key at [console.groq.com](https://console.groq.com)")
+    st.divider()
     st.subheader("Your Background")
     background = st.text_area("Edit your background (used in all prompts)",
                                value=DEFAULT_BACKGROUND, height=200)
@@ -267,9 +479,17 @@ with st.sidebar:
             st.error("Could not parse file. Check the format.")
     if st.session_state["resume_bullets"]:
         with st.expander("View loaded bullets"):
-            for role, bullets in st.session_state["resume_bullets"].items():
-                st.markdown(f"**{role}**")
-                st.text(bullets)
+            rb = st.session_state["resume_bullets"]
+            if is_nested_bullets(rb):
+                for company, roles in rb.items():
+                    st.markdown(f"**{company}**")
+                    for role, bullets in roles.items():
+                        st.markdown(f"*{role}*")
+                        st.text(bullets)
+            else:
+                for role, bullets in rb.items():
+                    st.markdown(f"**{role}**")
+                    st.text(bullets)
         if st.button("Clear resume bullets", use_container_width=True):
             st.session_state["resume_bullets"] = {}
             st.rerun()
@@ -388,6 +608,46 @@ mutual_connection = st.text_input(
 
 st.divider()
 
+# ── LinkedIn Profile Analyzer ─────────────────────────────────────────────────
+with st.expander("LinkedIn Profile Analyzer — paste full profile for AI insights"):
+    li_full_text = st.text_area(
+        "Paste the full LinkedIn profile text",
+        placeholder="Copy everything from their LinkedIn page: name, title, About, Experience, Education...",
+        height=200,
+        label_visibility="collapsed",
+    )
+    if st.button("Analyze Profile", use_container_width=True):
+        if not li_full_text.strip():
+            st.warning("Paste some profile text first.")
+        elif not api_key:
+            st.warning("Enter your Anthropic API key in the sidebar first.")
+        else:
+            with st.spinner("Analyzing profile..."):
+                try:
+                    analysis = analyze_linkedin_profile(api_key, li_full_text, background)
+                    st.session_state["li_analysis"] = analysis
+                    # Also try to auto-fill recipient fields
+                    info = extract_profile_info(api_key, li_full_text)
+                    if info.get("name") or info.get("company"):
+                        st.session_state["recipient_name"] = info.get("name", st.session_state["recipient_name"])
+                        st.session_state["recipient_role"] = info.get("role", st.session_state["recipient_role"])
+                        st.session_state["recipient_company"] = info.get("company", st.session_state["recipient_company"])
+                        st.success("Recipient fields auto-filled!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    if st.session_state["li_analysis"]:
+        st.markdown(st.session_state["li_analysis"])
+        if st.button("Use this angle in context", key="use_angle_btn"):
+            # Pre-populate the key angle field with suggested angle
+            analysis_text = st.session_state["li_analysis"]
+            angle_match = re.search(r"## Suggested Message Angle\n(.+?)(?:\n##|$)", analysis_text, re.DOTALL)
+            if angle_match:
+                st.session_state["key_angle_text"] = angle_match.group(1).strip()
+            st.rerun()
+
+st.divider()
+
 # ── Job Description ───────────────────────────────────────────────────────────
 st.subheader("Job Description (optional)")
 jd_col1, jd_col2 = st.columns([4, 1])
@@ -422,6 +682,58 @@ jd_text = st.text_area(
 
 st.divider()
 
+# ── Company Research ───────────────────────────────────────────────────────────
+with st.expander("Company News Search — find recent updates to reference in your message"):
+    st.caption("Searches the web for the last 6 months of news about the company and suggests message hooks.")
+    news_company = st.text_input(
+        "Company to search",
+        value=st.session_state.get("recipient_company", ""),
+        placeholder="e.g. Databricks",
+        key="news_company_input",
+    )
+    news_role = st.text_input(
+        "Role / team (optional, narrows results)",
+        value=st.session_state.get("recipient_role", ""),
+        placeholder="e.g. Strategy & Operations",
+        key="news_role_input",
+    )
+    if st.button("Search recent news", use_container_width=True):
+        if not news_company.strip():
+            st.warning("Enter a company name first.")
+        elif not api_key:
+            st.warning("Enter your Anthropic API key in the sidebar first.")
+        else:
+            with st.spinner(f"Searching recent news for {news_company}..."):
+                try:
+                    news_items = search_company_news(api_key, news_company, news_role)
+                    st.session_state["company_news"] = news_items
+                    st.session_state["company_news_for"] = news_company
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    st.session_state["company_news"] = []
+
+    if st.session_state.get("company_news"):
+        st.markdown(f"**Recent updates for {st.session_state.get('company_news_for', '')}:**")
+        for i, item in enumerate(st.session_state["company_news"]):
+            col_news, col_btn = st.columns([5, 1])
+            with col_news:
+                st.markdown(f"**{item.get('title', '')}**")
+                st.caption(item.get("hook", ""))
+                if item.get("url"):
+                    st.caption(f"[{item['url'][:60]}]")
+            with col_btn:
+                if st.button("Use", key=f"use_news_{i}", use_container_width=True):
+                    hook_text = item.get("hook", item.get("title", ""))
+                    existing = st.session_state.get("pasted_context_text", "")
+                    st.session_state["pasted_context_text"] = (
+                        f"{existing}\n\nRecent news hook: {hook_text}".strip()
+                    )
+                    st.rerun()
+    elif "company_news" in st.session_state and st.session_state["company_news"] == []:
+        st.info("No recent news found — try a different company name or add context manually.")
+
+st.divider()
+
 # ── Context ───────────────────────────────────────────────────────────────────
 st.subheader("Additional Context")
 input_mode = st.radio("How do you want to add context?",
@@ -431,22 +743,50 @@ input_mode = st.radio("How do you want to add context?",
 key_angle = ""
 pasted_context = ""
 
+def _render_stt_recorder(field_key: str, groq_key: str):
+    """Render a speech-to-text recorder for a given session state field."""
+    if not AUDIO_RECORDER_AVAILABLE or not GROQ_AVAILABLE:
+        return
+    with st.expander("🎤 Record instead of typing"):
+        if not groq_key:
+            st.caption("Add a Groq API key in the sidebar to enable speech-to-text.")
+            return
+        audio_bytes = audio_recorder(text="Click to record", pause_threshold=3.0,
+                                     key=f"recorder_{field_key}")
+        if audio_bytes:
+            with st.spinner("Transcribing..."):
+                try:
+                    transcribed = transcribe_audio(groq_key, audio_bytes)
+                    st.session_state[field_key] = transcribed
+                    st.success(f"Transcribed: {transcribed[:80]}{'...' if len(transcribed) > 80 else ''}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Transcription error: {e}")
+
 if input_mode in ["Quick form", "Both"]:
+    _render_stt_recorder("key_angle_text", groq_api_key)
     key_angle = st.text_area(
         "What's the specific angle or ask?",
+        value=st.session_state["key_angle_text"],
         placeholder=(
             "e.g. I applied to the MBA Intern S&O role. I want to ask for a 20-min chat and "
             "mention my background in consulting + Chief of Staff work."
         ),
         height=100,
+        key="key_angle_input",
     )
+    st.session_state["key_angle_text"] = key_angle
 
 if input_mode in ["Paste text", "Both"]:
+    _render_stt_recorder("pasted_context_text", groq_api_key)
     pasted_context = st.text_area(
         "Paste any additional context",
+        value=st.session_state["pasted_context_text"],
         placeholder="Recent news about the company, the person's recent posts, extra background, etc.",
         height=130,
+        key="pasted_context_input",
     )
+    st.session_state["pasted_context_text"] = pasted_context
 
 tone = st.select_slider("Tone", options=["More formal", "Balanced", "Warm & personal"],
                          value="Balanced")
@@ -479,12 +819,23 @@ My background to draw from:
 
         user_prompt += "\nRemember: strictly 100-150 words for InMail, natural length for email. Be specific to this person and company."
 
-        system_prompt = build_system_prompt(background, st.session_state["resume_bullets"])
+        system_prompt = build_system_prompt(background, st.session_state["resume_bullets"],
+                                             recipient_company=recipient_company)
 
         with st.spinner("Writing your message..."):
             try:
                 result = generate_message(api_key, user_prompt, system_prompt)
                 st.session_state["result"] = result
+                # Save to persistent history
+                save_to_history({
+                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "msg_type": msg_type,
+                    "purpose": purpose,
+                    "recipient_name": recipient_name,
+                    "recipient_role": recipient_role,
+                    "recipient_company": recipient_company,
+                    "message": result,
+                })
             except Exception as e:
                 if "API_KEY" in str(e) or "invalid" in str(e).lower():
                     st.error("Invalid API key. Check your key at console.anthropic.com.")
@@ -513,3 +864,53 @@ if "result" in st.session_state:
         st.download_button("Download as .txt", data=edited,
                            file_name="message.txt", mime="text/plain",
                            use_container_width=True)
+
+# ── Message History ────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("Message History")
+history = load_history()
+if not history:
+    st.caption("No messages yet — generate one above and it'll appear here.")
+else:
+    h_col1, h_col2 = st.columns([3, 1])
+    with h_col1:
+        st.caption(f"{len(history)} message(s) saved")
+    with h_col2:
+        csv_data = history_to_csv(history)
+        st.download_button("Download CSV", data=csv_data,
+                           file_name="message_history.csv", mime="text/csv",
+                           use_container_width=True)
+
+    if st.session_state["history_confirm_clear"]:
+        st.warning("Are you sure? This will permanently delete all history.")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if st.button("Yes, clear all", use_container_width=True, type="primary"):
+                import os as _os
+                if _os.path.exists(HISTORY_FILE):
+                    _os.remove(HISTORY_FILE)
+                st.session_state["history_confirm_clear"] = False
+                st.rerun()
+        with cc2:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state["history_confirm_clear"] = False
+                st.rerun()
+    else:
+        if st.button("Clear all history", use_container_width=True):
+            st.session_state["history_confirm_clear"] = True
+            st.rerun()
+
+    for i, entry in enumerate(reversed(history)):
+        label = (f"{entry.get('timestamp', '')}  ·  "
+                 f"{entry.get('recipient_name', '?')} @ {entry.get('recipient_company', '?')}  ·  "
+                 f"{entry.get('msg_type', '')}")
+        with st.expander(label):
+            st.caption(entry.get("purpose", ""))
+            st.text_area("Message", value=entry.get("message", ""), height=200,
+                         label_visibility="collapsed",
+                         key=f"hist_msg_{i}")
+            st.download_button("Download", data=entry.get("message", ""),
+                               file_name=f"message_{entry.get('timestamp','').replace(' ','_').replace(':','-')}.txt",
+                               mime="text/plain",
+                               key=f"hist_dl_{i}",
+                               use_container_width=True)
