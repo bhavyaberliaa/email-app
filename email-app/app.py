@@ -18,6 +18,11 @@ try:
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
+try:
+    import fitz  # PyMuPDF
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Bhavya's Message Writer", page_icon="✉️", layout="centered")
@@ -117,6 +122,7 @@ st.markdown("""
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "message_history.json")
+RESUME_DB_FILE = os.path.join(os.path.dirname(__file__), "resume_db.json")
 
 # ── History helpers ───────────────────────────────────────────────────────────
 def load_history() -> list:
@@ -143,6 +149,142 @@ def history_to_csv(history: list) -> str:
     writer.writeheader()
     writer.writerows(history)
     return buf.getvalue()
+
+# ── Resume database helpers ───────────────────────────────────────────────────
+def load_resume_db() -> list:
+    try:
+        with open(RESUME_DB_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_resume_db(db: list):
+    with open(RESUME_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
+
+def extract_pdf_text(uploaded_file) -> str:
+    if not PDFPLUMBER_AVAILABLE:
+        return ""
+    try:
+        pdf_bytes = uploaded_file.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        return "\n".join(page.get_text() for page in doc)
+    except Exception:
+        return ""
+
+def analyze_resume_for_db(api_key: str, resume_text: str, filename: str, role_type: str, role_note: str = "") -> dict:
+    """Use Claude Haiku to extract company, industry, and key bullets from a resume."""
+    stem = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ")
+    parts = [p for p in stem.split() if len(p) > 2]
+    company_hint = parts[-1] if parts else ""
+
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=600,
+        messages=[{"role": "user", "content": (
+            f"Analyze this resume and extract:\n"
+            f"1. Company it was tailored for (filename hint: '{company_hint}' — confirm or correct from resume content)\n"
+            f"2. Industry/sector of that company (e.g. 'Travel & Marketplace', 'Data & AI Infrastructure', 'EdTech', 'Consumer Social', 'Fintech')\n"
+            f"3. 5-6 most impactful bullet points from the resume\n\n"
+            f"Role type (user-provided): {role_type}\n"
+            f"Role note: {role_note if role_note else 'None'}\n\n"
+            f"Return ONLY JSON:\n"
+            f"{{\"company\": \"...\", \"industry\": \"...\", \"bullets\": \"• bullet1\\n• bullet2\\n...\"}}\n\n"
+            f"RESUME:\n{resume_text[:4000]}"
+        )}]
+    )
+    try:
+        raw = resp.content[0].text.strip()
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception:
+        pass
+    return {"company": company_hint, "industry": "", "bullets": ""}
+
+def find_relevant_resumes(api_key: str, db: list, target_company: str, target_role_type: str) -> str:
+    """Score each resume in the DB and return bullets from the most relevant one(s).
+
+    Priority rules:
+      100 — same company + same role type
+       80 — same industry + same role type  (requires Haiku call)
+       60 — same company, any role type
+       40 — same role type, any company/industry
+       20 — same industry, any role type
+       10 — fallback (most recent)
+    """
+    if not db:
+        return ""
+
+    target_co = target_company.lower().strip()
+    target_role = target_role_type.lower().strip()
+
+    def _co_match(r_co):
+        r = r_co.lower().strip()
+        return r == target_co or target_co in r or r in target_co
+
+    def _role_match(r_role):
+        r = r_role.lower().strip()
+        return r == target_role or target_role in r or r in target_role
+
+    # Step 1: Rule-based scoring
+    scored = []
+    for resume in db:
+        cm = _co_match(resume.get("company", ""))
+        rm = _role_match(resume.get("role_type", ""))
+        if cm and rm:
+            score = 100
+        elif cm:
+            score = 60
+        elif rm:
+            score = 40
+        else:
+            score = 10
+        scored.append([score, resume])
+
+    # Step 2: Industry boost via Haiku (only if no exact company match)
+    max_score = max(s for s, _ in scored)
+    if max_score < 100 and api_key:
+        industries = [(r.get("company", ""), r.get("industry", "")) for r in db if r.get("industry")]
+        if industries:
+            lines = "\n".join(f"- {c}: {ind}" for c, ind in industries)
+            try:
+                client = anthropic.Anthropic(api_key=api_key)
+                resp = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=150,
+                    messages=[{"role": "user", "content": (
+                        f"Is '{target_company}' in the same industry as any of these companies?\n{lines}\n\n"
+                        f"Return ONLY JSON: {{\"same_industry_as\": [\"CompanyName\", ...]}} — list only those in the same industry. Empty array if none."
+                    )}]
+                )
+                raw = resp.content[0].text.strip()
+                m = re.search(r"\{.*\}", raw, re.DOTALL)
+                if m:
+                    same_industry = [c.lower() for c in json.loads(m.group()).get("same_industry_as", [])]
+                    for item in scored:
+                        r_co = item[1].get("company", "").lower()
+                        if any(r_co in si or si in r_co for si in same_industry):
+                            rm = _role_match(item[1].get("role_type", ""))
+                            item[0] = max(item[0], 80 if rm else 20)
+            except Exception:
+                pass
+
+    # Step 3: Sort and pick top 1-2 complementary resumes
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected = [scored[0][1]]
+    if len(scored) > 1 and scored[1][0] >= 40:
+        # Add second only if it offers a different role type (complementary)
+        if scored[1][1].get("role_type", "").lower() != scored[0][1].get("role_type", "").lower():
+            selected.append(scored[1][1])
+
+    result = ""
+    for r in selected:
+        note = f" | note: {r['role_note']}" if r.get("role_note") else ""
+        result += f"[{r.get('company', '?')} — {r.get('role_type', '?')} | {r.get('industry', '?')}{note}]\n{r.get('bullets', '')}\n\n"
+    return result.strip()
 
 # ── Few-shot training examples from Bhavya's real messages ───────────────────
 EXAMPLES = """
@@ -189,7 +331,7 @@ DEFAULT_BACKGROUND = """- Haas MBA '27 (Class of 2027), UC Berkeley, first-year 
 - Interests: PM, Strategy & Ops, education tech, AI/ML products, creative tech, monetization"""
 
 # ── System prompt builder ─────────────────────────────────────────────────────
-def build_system_prompt(background_text: str, resume_bullets: dict, recipient_company: str = "") -> str:
+def build_system_prompt(background_text: str, resume_bullets: dict, recipient_company: str = "", relevant_bullets: str = "") -> str:
     prompt = f"""You are a professional message writer for Bhavya Berlia, a first-year MBA student at UC Berkeley Haas (Class of 2027). You write tailored emails and LinkedIn InMails in Bhavya's authentic voice.
 
 BHAVYA'S BACKGROUND:
@@ -213,7 +355,11 @@ LENGTH RULES:
 REAL EXAMPLES OF BHAVYA'S MESSAGES:
 {EXAMPLES}
 """
-    if resume_bullets:
+    if relevant_bullets:
+        prompt += "\nBHAVYA'S MOST RELEVANT RESUME BULLETS (auto-selected for this company and role):\n"
+        prompt += "These were picked from the resume database as the best match — prefer these highlights when writing the message.\n"
+        prompt += relevant_bullets + "\n"
+    elif resume_bullets:
         nested = is_nested_bullets(resume_bullets)
         if nested:
             prompt += "\nBHAVYA'S RESUME BULLETS (organized by company and role type):\n"
@@ -554,36 +700,95 @@ with st.sidebar:
                                value=DEFAULT_BACKGROUND, height=200)
     st.caption("Pre-filled with your profile. Edit anytime.")
     st.divider()
-    st.subheader("Resume Bullets by Role")
+    st.subheader("Resume Database")
     st.caption(
-        "Upload a `.json` or `.txt` file with resume highlights organized by role type "
-        "(PM, S&O, etc.). Claude will pick the most relevant bullets per message."
+        "Upload your PDF resumes — the system automatically picks the most relevant one "
+        "when writing each message, based on company, industry, and role."
     )
-    resume_file = st.file_uploader("Upload resume bullets file", type=["json", "txt"],
-                                   label_visibility="collapsed")
-    if resume_file:
-        parsed = parse_resume_file(resume_file)
-        if parsed:
-            st.session_state["resume_bullets"] = parsed
-            st.success(f"Loaded {len(parsed)} role type(s): {', '.join(parsed.keys())}")
-        else:
-            st.error("Could not parse file. Check the format.")
-    if st.session_state["resume_bullets"]:
-        with st.expander("View loaded bullets"):
-            rb = st.session_state["resume_bullets"]
-            if is_nested_bullets(rb):
-                for company, roles in rb.items():
-                    st.markdown(f"**{company}**")
-                    for role, bullets in roles.items():
-                        st.markdown(f"*{role}*")
-                        st.text(bullets)
+    _db = load_resume_db()
+    if _db:
+        for _i, _r in enumerate(_db):
+            _col_info, _col_del = st.columns([5, 1])
+            with _col_info:
+                _note_str = f"  \n*{_r['role_note']}*" if _r.get("role_note") else ""
+                st.markdown(
+                    f"**{_r.get('company', '?')}** · {_r.get('role_type', '?')}{_note_str}  \n"
+                    f"<span style='font-size:0.78rem;color:#94a3b8;'>{_r.get('industry', '')}</span>",
+                    unsafe_allow_html=True,
+                )
+            with _col_del:
+                if st.button("✕", key=f"del_resume_{_i}", help="Remove"):
+                    _db.pop(_i)
+                    save_resume_db(_db)
+                    st.rerun()
+        st.markdown("---")
+
+    if PDFPLUMBER_AVAILABLE:
+        _new_resume = st.file_uploader(
+            "Upload a PDF resume", type=["pdf"],
+            key="resume_pdf_upload", label_visibility="collapsed",
+        )
+        if _new_resume:
+            _role_type_sel = st.selectbox(
+                "Role type for this resume",
+                ["PM", "S&O", "Consulting", "MBA Recruiting", "General", "Other"],
+                key="resume_role_type_sel",
+            )
+            _role_note_inp = st.text_input(
+                "Role note (optional)",
+                placeholder="e.g. marketplace growth, SQL-heavy analytics",
+                key="resume_role_note_inp",
+            )
+            if st.button("Add to database", use_container_width=True, key="add_resume_btn"):
+                if not api_key:
+                    st.warning("Enter your Anthropic API key first.")
+                else:
+                    with st.spinner("Reading and analyzing resume..."):
+                        _pdf_text = extract_pdf_text(_new_resume)
+                    if _pdf_text.strip():
+                        with st.spinner("Extracting company, industry & bullets..."):
+                            _info = analyze_resume_for_db(
+                                api_key, _pdf_text, _new_resume.name,
+                                _role_type_sel, _role_note_inp,
+                            )
+                        _db = load_resume_db()
+                        _db.append({
+                            "id": str(datetime.datetime.now().timestamp()),
+                            "filename": _new_resume.name,
+                            "company": _info.get("company", ""),
+                            "industry": _info.get("industry", ""),
+                            "role_type": _role_type_sel,
+                            "role_note": _role_note_inp,
+                            "bullets": _info.get("bullets", ""),
+                            "added_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                        save_resume_db(_db)
+                        st.success(
+                            f"Added! Detected: **{_info.get('company', '?')}** · {_info.get('industry', '?')}"
+                        )
+                        st.rerun()
+                    else:
+                        st.error("Couldn't extract text — make sure it's not a scanned image PDF.")
+    else:
+        st.warning("Install `pdfplumber` to enable PDF upload.")
+
+    with st.expander("Simple bullets (.json / .txt)"):
+        st.caption("Flat file with bullets by role type — used if no PDF database entry matches.")
+        _resume_file = st.file_uploader(
+            "Upload resume bullets", type=["json", "txt"],
+            label_visibility="collapsed", key="resume_bullets_upload",
+        )
+        if _resume_file:
+            _parsed = parse_resume_file(_resume_file)
+            if _parsed:
+                st.session_state["resume_bullets"] = _parsed
+                st.success(f"Loaded: {', '.join(_parsed.keys())}")
             else:
-                for role, bullets in rb.items():
-                    st.markdown(f"**{role}**")
-                    st.text(bullets)
-        if st.button("Clear resume bullets", use_container_width=True):
-            st.session_state["resume_bullets"] = {}
-            st.rerun()
+                st.error("Could not parse file.")
+        if st.session_state["resume_bullets"]:
+            if st.button("Clear bullets", use_container_width=True, key="clear_bullets_btn"):
+                st.session_state["resume_bullets"] = {}
+                st.rerun()
 
 # ── STT recorder helper (defined before tabs so it's available everywhere) ────
 def _render_stt_recorder(field_key: str, groq_key: str):
@@ -835,8 +1040,14 @@ My background to draw from:
 
             user_prompt += "\nRemember: strictly 100-150 words for InMail, natural length for email. Be specific to this person and company."
 
+            _resume_db = load_resume_db()
+            _relevant_bullets = ""
+            if _resume_db and recipient_company:
+                with st.spinner("Selecting best resume match..."):
+                    _relevant_bullets = find_relevant_resumes(api_key, _resume_db, recipient_company, recipient_role)
             system_prompt = build_system_prompt(background, st.session_state["resume_bullets"],
-                                                 recipient_company=recipient_company)
+                                                 recipient_company=recipient_company,
+                                                 relevant_bullets=_relevant_bullets)
 
             with st.spinner("Writing your message..."):
                 try:

@@ -4,3 +4,4 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 groq>=0.9.0
 audio-recorder-streamlit>=0.0.8
+pymupdf>=1.23.0
