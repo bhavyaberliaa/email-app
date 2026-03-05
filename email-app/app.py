@@ -173,7 +173,7 @@ def extract_pdf_text(uploaded_file) -> str:
     except Exception:
         return ""
 
-def analyze_resume_for_db(api_key: str, resume_text: str, filename: str, role_type: str, role_note: str = "") -> dict:
+def analyze_resume_for_db(api_key: str, resume_text: str, filename: str, role_type: str, applied_role: str = "") -> dict:
     """Use Claude Haiku to extract company, industry, and key bullets from a resume."""
     stem = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ")
     parts = [p for p in stem.split() if len(p) > 2]
@@ -187,9 +187,9 @@ def analyze_resume_for_db(api_key: str, resume_text: str, filename: str, role_ty
             f"Analyze this resume and extract:\n"
             f"1. Company it was tailored for (filename hint: '{company_hint}' — confirm or correct from resume content)\n"
             f"2. Industry/sector of that company (e.g. 'Travel & Marketplace', 'Data & AI Infrastructure', 'EdTech', 'Consumer Social', 'Fintech')\n"
-            f"3. 5-6 most impactful bullet points from the resume\n\n"
-            f"Role type (user-provided): {role_type}\n"
-            f"Role note: {role_note if role_note else 'None'}\n\n"
+            f"3. 5-6 most impactful bullet points from the resume — prioritize bullets most relevant to the role applied for\n\n"
+            f"Role category (user-provided): {role_type}\n"
+            f"Role applied for: {applied_role if applied_role else 'Not specified'}\n\n"
             f"Return ONLY JSON:\n"
             f"{{\"company\": \"...\", \"industry\": \"...\", \"bullets\": \"• bullet1\\n• bullet2\\n...\"}}\n\n"
             f"RESUME:\n{resume_text[:4000]}"
@@ -229,17 +229,34 @@ def find_relevant_resumes(api_key: str, db: list, target_company: str, target_ro
         r = r_role.lower().strip()
         return r == target_role or target_role in r or r in target_role
 
+    def _applied_role_match(applied_role: str) -> bool:
+        """Check if the resume's applied_role is semantically close to the target role."""
+        if not applied_role or not target_role:
+            return False
+        ar = applied_role.lower()
+        # Match if target role words appear in applied_role or vice versa
+        target_words = set(w for w in target_role.split() if len(w) > 3)
+        applied_words = set(w for w in ar.split() if len(w) > 3)
+        return bool(target_words & applied_words)
+
     # Step 1: Rule-based scoring
     scored = []
     for resume in db:
         cm = _co_match(resume.get("company", ""))
         rm = _role_match(resume.get("role_type", ""))
+        arm = _applied_role_match(resume.get("applied_role", "") or resume.get("role_note", ""))
         if cm and rm:
             score = 100
+        elif cm and arm:
+            score = 90  # same company + matching applied role title
         elif cm:
             score = 60
+        elif rm and arm:
+            score = 50  # same category + matching applied role title
         elif rm:
             score = 40
+        elif arm:
+            score = 30  # applied role title matches even if different category
         else:
             score = 10
         scored.append([score, resume])
@@ -282,8 +299,9 @@ def find_relevant_resumes(api_key: str, db: list, target_company: str, target_ro
 
     result = ""
     for r in selected:
-        note = f" | note: {r['role_note']}" if r.get("role_note") else ""
-        result += f"[{r.get('company', '?')} — {r.get('role_type', '?')} | {r.get('industry', '?')}{note}]\n{r.get('bullets', '')}\n\n"
+        applied = r.get("applied_role") or r.get("role_note") or ""
+        role_label = f" → {applied}" if applied else ""
+        result += f"[{r.get('company', '?')} — {r.get('role_type', '?')}{role_label} | {r.get('industry', '?')}]\n{r.get('bullets', '')}\n\n"
     return result.strip()
 
 # ── Few-shot training examples from Bhavya's real messages ───────────────────
@@ -710,9 +728,10 @@ with st.sidebar:
         for _i, _r in enumerate(_db):
             _col_info, _col_del = st.columns([5, 1])
             with _col_info:
-                _note_str = f"  \n*{_r['role_note']}*" if _r.get("role_note") else ""
+                _applied = _r.get("applied_role") or _r.get("role_note") or ""
+                _applied_str = f"  \n*{_applied}*" if _applied else ""
                 st.markdown(
-                    f"**{_r.get('company', '?')}** · {_r.get('role_type', '?')}{_note_str}  \n"
+                    f"**{_r.get('company', '?')}** · {_r.get('role_type', '?')}{_applied_str}  \n"
                     f"<span style='font-size:0.78rem;color:#94a3b8;'>{_r.get('industry', '')}</span>",
                     unsafe_allow_html=True,
                 )
@@ -724,51 +743,67 @@ with st.sidebar:
         st.markdown("---")
 
     if PDFPLUMBER_AVAILABLE:
-        _new_resume = st.file_uploader(
-            "Upload a PDF resume", type=["pdf"],
+        _new_resumes = st.file_uploader(
+            "Upload PDF resumes", type=["pdf"],
             key="resume_pdf_upload", label_visibility="collapsed",
+            accept_multiple_files=True,
         )
-        if _new_resume:
-            _role_type_sel = st.selectbox(
-                "Role type for this resume",
-                ["PM", "S&O", "Consulting", "MBA Recruiting", "General", "Other"],
-                key="resume_role_type_sel",
-            )
-            _role_note_inp = st.text_input(
-                "Role note (optional)",
-                placeholder="e.g. marketplace growth, SQL-heavy analytics",
-                key="resume_role_note_inp",
-            )
-            if st.button("Add to database", use_container_width=True, key="add_resume_btn"):
+        if _new_resumes:
+            st.caption("Tag each resume with the role it was made for, then click **Add all to database**.")
+            _role_type_options = ["PM", "S&O", "Consulting", "MBA Recruiting", "General", "Other"]
+            for _uf in _new_resumes:
+                _cols = st.columns([2, 3, 2])
+                with _cols[0]:
+                    st.markdown(f"<span style='font-size:0.85rem;'>{_uf.name}</span>", unsafe_allow_html=True)
+                with _cols[1]:
+                    st.text_input(
+                        "Role applied for",
+                        placeholder="e.g. S&O Manager, Enterprise · Stripe",
+                        key=f"applied_role_{_uf.name}",
+                        label_visibility="collapsed",
+                    )
+                with _cols[2]:
+                    st.selectbox(
+                        "Category",
+                        _role_type_options,
+                        key=f"role_type_{_uf.name}",
+                        label_visibility="collapsed",
+                    )
+            if st.button("Add all to database", use_container_width=True, key="add_resume_btn"):
                 if not api_key:
                     st.warning("Enter your Anthropic API key first.")
                 else:
-                    with st.spinner("Reading and analyzing resume..."):
-                        _pdf_text = extract_pdf_text(_new_resume)
-                    if _pdf_text.strip():
-                        with st.spinner("Extracting company, industry & bullets..."):
-                            _info = analyze_resume_for_db(
-                                api_key, _pdf_text, _new_resume.name,
-                                _role_type_sel, _role_note_inp,
-                            )
-                        _db = load_resume_db()
+                    _db = load_resume_db()
+                    _added, _failed = [], []
+                    for _uf in _new_resumes:
+                        _applied_role = st.session_state.get(f"applied_role_{_uf.name}", "")
+                        _role_type = st.session_state.get(f"role_type_{_uf.name}", "General")
+                        with st.spinner(f"Analyzing {_uf.name}..."):
+                            _pdf_text = extract_pdf_text(_uf)
+                        if not _pdf_text.strip():
+                            _failed.append(_uf.name)
+                            continue
+                        with st.spinner(f"Extracting bullets for {_uf.name}..."):
+                            _info = analyze_resume_for_db(api_key, _pdf_text, _uf.name, _role_type, _applied_role)
                         _db.append({
                             "id": str(datetime.datetime.now().timestamp()),
-                            "filename": _new_resume.name,
+                            "filename": _uf.name,
                             "company": _info.get("company", ""),
                             "industry": _info.get("industry", ""),
-                            "role_type": _role_type_sel,
-                            "role_note": _role_note_inp,
+                            "role_type": _role_type,
+                            "applied_role": _applied_role,
+                            "role_note": _applied_role,  # backward compat
                             "bullets": _info.get("bullets", ""),
                             "added_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         })
-                        save_resume_db(_db)
-                        st.success(
-                            f"Added! Detected: **{_info.get('company', '?')}** · {_info.get('industry', '?')}"
-                        )
+                        _added.append(f"**{_info.get('company', _uf.name)}** · {_info.get('industry', '')}")
+                    save_resume_db(_db)
+                    if _added:
+                        st.success(f"Added {len(_added)}: " + ", ".join(_added))
+                    if _failed:
+                        st.error(f"Couldn't read (scanned PDF?): {', '.join(_failed)}")
+                    if _added:
                         st.rerun()
-                    else:
-                        st.error("Couldn't extract text — make sure it's not a scanned image PDF.")
     else:
         st.warning("Install `pdfplumber` to enable PDF upload.")
 
