@@ -173,6 +173,16 @@ def extract_pdf_text(uploaded_file) -> str:
     except Exception:
         return ""
 
+def extract_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text from PDF bytes (used for queue-persisted resumes)."""
+    if not PDFPLUMBER_AVAILABLE:
+        return ""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        return "\n".join(page.get_text() for page in doc)
+    except Exception:
+        return ""
+
 def analyze_resume_for_db(api_key: str, resume_text: str, filename: str, role_type: str, applied_role: str = "") -> dict:
     """Use Claude Haiku to extract company, industry, and key bullets from a resume."""
     stem = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ")
@@ -653,6 +663,7 @@ for _key, _default in [
     ("history_confirm_clear", False),
     ("company_news", None),
     ("company_news_for", ""),
+    ("pending_resumes", []),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -748,46 +759,64 @@ with st.sidebar:
             key="resume_pdf_upload", label_visibility="collapsed",
             accept_multiple_files=True,
         )
+        # Enqueue newly uploaded files — store bytes so they survive reruns
         if _new_resumes:
+            _queued_names = {r["name"] for r in st.session_state["pending_resumes"]}
+            for _uf in _new_resumes:
+                if _uf.name not in _queued_names:
+                    st.session_state["pending_resumes"].append({
+                        "name": _uf.name,
+                        "bytes": _uf.read(),
+                    })
+
+        if st.session_state["pending_resumes"]:
             st.caption("Tag each resume with the role it was made for, then click **Add all to database**.")
             _role_type_options = ["PM", "S&O", "Consulting", "MBA Recruiting", "General", "Other"]
-            for _uf in _new_resumes:
-                _cols = st.columns([2, 3, 2])
+            _remove_idx = None
+            for _i, _pr in enumerate(st.session_state["pending_resumes"]):
+                _cols = st.columns([3, 3, 2, 1])
                 with _cols[0]:
-                    st.markdown(f"<span style='font-size:0.85rem;'>{_uf.name}</span>", unsafe_allow_html=True)
+                    st.markdown(f"<span style='font-size:0.85rem;'>{_pr['name']}</span>", unsafe_allow_html=True)
                 with _cols[1]:
                     st.text_input(
                         "Role applied for",
-                        placeholder="e.g. S&O Manager, Enterprise · Stripe",
-                        key=f"applied_role_{_uf.name}",
+                        placeholder="e.g. S&O Manager · Stripe",
+                        key=f"applied_role_{_i}",
                         label_visibility="collapsed",
                     )
                 with _cols[2]:
                     st.selectbox(
                         "Category",
                         _role_type_options,
-                        key=f"role_type_{_uf.name}",
+                        key=f"role_type_{_i}",
                         label_visibility="collapsed",
                     )
+                with _cols[3]:
+                    if st.button("✕", key=f"remove_queued_{_i}", help="Remove"):
+                        _remove_idx = _i
+            if _remove_idx is not None:
+                st.session_state["pending_resumes"].pop(_remove_idx)
+                st.rerun()
+
             if st.button("Add all to database", use_container_width=True, key="add_resume_btn"):
                 if not api_key:
                     st.warning("Enter your Anthropic API key first.")
                 else:
                     _db = load_resume_db()
                     _added, _failed = [], []
-                    for _uf in _new_resumes:
-                        _applied_role = st.session_state.get(f"applied_role_{_uf.name}", "")
-                        _role_type = st.session_state.get(f"role_type_{_uf.name}", "General")
-                        with st.spinner(f"Analyzing {_uf.name}..."):
-                            _pdf_text = extract_pdf_text(_uf)
+                    for _i, _pr in enumerate(st.session_state["pending_resumes"]):
+                        _applied_role = st.session_state.get(f"applied_role_{_i}", "")
+                        _role_type = st.session_state.get(f"role_type_{_i}", "General")
+                        with st.spinner(f"Analyzing {_pr['name']}..."):
+                            _pdf_text = extract_pdf_bytes(_pr["bytes"])
                         if not _pdf_text.strip():
-                            _failed.append(_uf.name)
+                            _failed.append(_pr["name"])
                             continue
-                        with st.spinner(f"Extracting bullets for {_uf.name}..."):
-                            _info = analyze_resume_for_db(api_key, _pdf_text, _uf.name, _role_type, _applied_role)
+                        with st.spinner(f"Extracting bullets for {_pr['name']}..."):
+                            _info = analyze_resume_for_db(api_key, _pdf_text, _pr["name"], _role_type, _applied_role)
                         _db.append({
                             "id": str(datetime.datetime.now().timestamp()),
-                            "filename": _uf.name,
+                            "filename": _pr["name"],
                             "company": _info.get("company", ""),
                             "industry": _info.get("industry", ""),
                             "role_type": _role_type,
@@ -796,8 +825,9 @@ with st.sidebar:
                             "bullets": _info.get("bullets", ""),
                             "added_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         })
-                        _added.append(f"**{_info.get('company', _uf.name)}** · {_info.get('industry', '')}")
+                        _added.append(f"**{_info.get('company', _pr['name'])}** · {_info.get('industry', '')}")
                     save_resume_db(_db)
+                    st.session_state["pending_resumes"] = []
                     if _added:
                         st.success(f"Added {len(_added)}: " + ", ".join(_added))
                     if _failed:
